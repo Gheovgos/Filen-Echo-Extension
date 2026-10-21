@@ -7,6 +7,7 @@ plugins {
 }
 
 dependencies {
+    implementation(libs.junit.junit)
     compileOnly(libs.echo.common)
     compileOnly(libs.kotlin.stdlib)
 

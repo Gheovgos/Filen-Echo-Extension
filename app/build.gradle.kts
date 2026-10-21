@@ -5,6 +5,7 @@ plugins {
 
 dependencies {
     implementation(project(":ext"))
+    implementation("org.json:json:20240303")
     compileOnly(libs.echo.common)
     compileOnly(libs.kotlin.stdlib)
 }
