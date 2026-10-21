@@ -4,24 +4,35 @@ import dev.brahmkshatriya.echo.common.clients.ExtensionClient
 import dev.brahmkshatriya.echo.common.clients.HomeFeedClient
 import dev.brahmkshatriya.echo.common.clients.LibraryFeedClient
 import dev.brahmkshatriya.echo.common.clients.LoginClient
+import dev.brahmkshatriya.echo.common.clients.TrackClient
+import dev.brahmkshatriya.echo.common.helpers.PagedData
 import dev.brahmkshatriya.echo.common.models.Feed
 import dev.brahmkshatriya.echo.common.models.Feed.Companion.toFeed
 import dev.brahmkshatriya.echo.common.models.Shelf
+import dev.brahmkshatriya.echo.common.models.Streamable
+import dev.brahmkshatriya.echo.common.models.Track
 import dev.brahmkshatriya.echo.common.models.User
 import dev.brahmkshatriya.echo.common.settings.Setting
 import dev.brahmkshatriya.echo.common.settings.SettingTextInput
 import dev.brahmkshatriya.echo.common.settings.Settings
 import dev.brahmkshatriya.echo.extension.auth.FilenApiClient
 import dev.brahmkshatriya.echo.extension.auth.FilenAuthManager
+import dev.brahmkshatriya.echo.extension.auth.FilenChunkInputStream
+import dev.brahmkshatriya.echo.extension.auth.FilenDriveClient
 import dev.brahmkshatriya.echo.extension.auth.FilenSession
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
-class FilenExtension : ExtensionClient, LoginClient.CustomInput, HomeFeedClient, LibraryFeedClient {
+class FilenExtension : ExtensionClient, LoginClient.CustomInput, HomeFeedClient, LibraryFeedClient,
+    TrackClient {
 
     private lateinit var settings: Settings
+
+    private val TAG = "FilenExt"
     private val apiClient = FilenApiClient()
     private val authManager = FilenAuthManager(apiClient)
+
+    private var drive: FilenDriveClient? = null
 
     companion object {
         const val KEY_MUSIC_PATH = "music_path"
@@ -33,17 +44,24 @@ class FilenExtension : ExtensionClient, LoginClient.CustomInput, HomeFeedClient,
 
     // --- ExtensionClient / SettingsProvider ---
 
-    override suspend fun getSettingItems(): List<Setting> = listOf(
-        SettingTextInput(
-            "Music Path",
-            KEY_MUSIC_PATH,
-            "Path of folder to use, ex. /Music/Echo",
-            DEFAULT_MUSIC_PATH
+    override suspend fun getSettingItems(): List<Setting> {
+        flog("getSettingItems")
+        return listOf(SettingTextInput(
+                "Music Path",
+                KEY_MUSIC_PATH,
+                "Path of folder to use, ex. /Music/Echo",
+                DEFAULT_MUSIC_PATH
+            )
         )
-    )
+    }
+
+    override suspend fun onInitialize() { flog("onInitialize") }
+
+    override suspend fun onExtensionSelected() { flog("onExtensionSelected") }
 
     override fun setSettings(settings: Settings) {
         this.settings = settings
+        flog("setSettings, settings: $settings")
     }
 
     private fun musicPath(): String {
@@ -95,12 +113,72 @@ class FilenExtension : ExtensionClient, LoginClient.CustomInput, HomeFeedClient,
             val keys = ex["masterKeys"]
             if (apiKey != null && keys != null) FilenSession(apiKey, keys.split("|")) else null
         }
+        flog("setLoginUser: user=${user != null}, session=${session != null}")
+        drive = session?.let { FilenDriveClient(apiClient, it) }
     }
 
-    override suspend fun getCurrentUser(): User? = currentUser?.copy(extras = emptyMap())
+    override suspend fun getCurrentUser(): User? {
+        flog("getCurrentUser")
+        return currentUser?.copy(extras = emptyMap())
+    }
 
-    override suspend fun loadHomeFeed(): Feed<Shelf> = emptyList<Shelf>().toFeed()
+    override suspend fun loadLibraryFeed(): Feed<Shelf> {
+        flog("loadLibraryFeed: ENTRATA")
+        return emptyList<Shelf>().toFeed()
+    }
 
-    override suspend fun loadLibraryFeed(): Feed<Shelf> = emptyList<Shelf>().toFeed()
+    override suspend fun loadHomeFeed(): Feed<Shelf> {
+        flog("Load home feed")
+        val drive = drive ?: error("Do Login first")
+        return PagedData.Single<Shelf> {
+            val root = drive.resolvePath(musicPath())
+            val tracks = flatten(drive.scan(root))
+            if (tracks.isEmpty()) error("No tracks found ${musicPath()} (uuid: $root)")
+            tracks.map { Shelf.Item(it) }
+        }.toFeed(Feed.Buttons(showPlayAndShuffle = true))
+    }
+
+    private fun flatten(node: FilenDriveClient.Node, parent: String? = null): List<Track> {
+        val label = listOfNotNull(parent, node.folder?.name).joinToString(" / ").ifEmpty { null }
+        return node.tracks.map { it.toTrack(label) } + node.children.flatMap { flatten(it, label) }
+    }
+
+    private fun FilenDriveClient.File.extras() = mapOf(
+        "uuid" to uuid, "name" to name, "region" to region, "bucket" to bucket,
+        "key" to key, "chunks" to chunks.toString(), "size" to size.toString()
+    )
+
+    private fun FilenDriveClient.File.toTrack(folder: String?) = Track(
+        id = uuid,
+        title = name.substringBeforeLast('.'),
+        subtitle = folder,
+        streamables = listOf(Streamable.server(uuid, 0, name, extras())),
+        extras = extras()
+    )
+
+    // --- TrackClient ---
+
+    override suspend fun loadTrack(track: Track, isDownload: Boolean): Track = track
+
+    override suspend fun loadFeed(track: Track): Feed<Shelf>? = null
+
+    override suspend fun loadStreamableMedia(streamable: Streamable, isDownload: Boolean): Streamable.Media {
+        val s = session ?: error("Do Login first")
+        val e = streamable.extras
+        val file = FilenDriveClient.File(
+            uuid = e.getValue("uuid"), name = e.getValue("name"), mime = "",
+            size = e.getValue("size").toLong(), key = e.getValue("key"),
+            region = e.getValue("region"), bucket = e.getValue("bucket"),
+            chunks = e.getValue("chunks").toInt()
+        )
+        val provider = Streamable.InputProvider { position, length ->
+            val stream = FilenChunkInputStream(apiClient.client, s.apiKey, file, position)
+            stream to (if (file.size > 0) file.size - position else -1L)
+        }
+        return Streamable.Media.Server(
+            listOf(Streamable.Source.Raw(streamProvider = provider, id = file.uuid)),
+            merged = false
+        )
+    }
 
 }
