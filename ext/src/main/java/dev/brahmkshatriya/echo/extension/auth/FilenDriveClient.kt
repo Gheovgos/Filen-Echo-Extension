@@ -18,7 +18,9 @@ class FilenDriveClient(private val api: FilenApiClient, private val session: Fil
 
     data class File(
         val uuid: String, val name: String, val mime: String, val size: Long,
-        val key: String, val region: String, val bucket: String, val chunks: Int
+        val key: String, val region: String, val bucket: String, val chunks: Int,
+        val lastModified: Long = 0L,  // mtime client (ms)
+        val creation: Long = 0L       // upload date Filen (ms)
     )
 
     data class Listing(val folders: List<Folder>, val files: List<File>)
@@ -33,6 +35,11 @@ class FilenDriveClient(private val api: FilenApiClient, private val session: Fil
     private fun JsonObject.str(k: String) = this[k]?.jsonPrimitive?.contentOrNull
     private fun JsonObject.arr(k: String) = (this[k] as? JsonArray) ?: JsonArray(emptyList())
 
+    private fun JsonObject.tsMs(k: String): Long {
+        val p = this[k]?.jsonPrimitive ?: return 0L
+        val n = p.longOrNull ?: p.contentOrNull?.toLongOrNull() ?: return 0L
+        return if (n in 1 until 100_000_000_000L) n * 1000 else n  // seconds -> ms
+    }
     private fun decrypt(meta: String) = FilenCrypto.decryptMetadata(meta, session.masterKeys)
 
     // GET /v3/user/baseFolder -> data.uuid
@@ -71,7 +78,9 @@ class FilenDriveClient(private val api: FilenApiClient, private val session: Fil
                     key = meta.str("key")!!,
                     region = o.str("region")!!,
                     bucket = o.str("bucket")!!,
-                    chunks = o["chunks"]?.jsonPrimitive?.intOrNull ?: 1
+                    chunks = o["chunks"]?.jsonPrimitive?.intOrNull ?: 1,
+                    lastModified = meta.tsMs("lastModified"),
+                    creation = meta.tsMs("creation")
                 )
             } catch (e: Exception) {
                 throw IllegalStateException("File was not readable (${e::class.simpleName}: ${e.message}); fields: ${o.keys}", e)

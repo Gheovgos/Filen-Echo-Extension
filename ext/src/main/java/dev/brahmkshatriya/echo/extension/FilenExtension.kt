@@ -8,6 +8,7 @@ import dev.brahmkshatriya.echo.common.clients.TrackClient
 import dev.brahmkshatriya.echo.common.helpers.PagedData
 import dev.brahmkshatriya.echo.common.models.Album
 import dev.brahmkshatriya.echo.common.models.Artist
+import dev.brahmkshatriya.echo.common.models.Date
 import dev.brahmkshatriya.echo.common.models.Feed
 import dev.brahmkshatriya.echo.common.models.Feed.Companion.toFeed
 import dev.brahmkshatriya.echo.common.models.ImageHolder
@@ -139,6 +140,8 @@ class FilenExtension : ExtensionClient, LoginClient.CustomInput, HomeFeedClient,
         return emptyList<Shelf>().toFeed()
     }
 
+    private fun FilenDriveClient.File.uploadedAt() = if (creation > 0) creation else lastModified
+
     override suspend fun loadHomeFeed(): Feed<Shelf> {
         flog("Home Feed")
         val drive = drive ?: error("Do Login first")
@@ -146,6 +149,10 @@ class FilenExtension : ExtensionClient, LoginClient.CustomInput, HomeFeedClient,
         return PagedData.Single<Shelf> {
             val root = drive.resolvePath(musicPath())
             val files = collect(drive.scan(root))
+                .sortedWith(
+                    compareByDescending<Pair<FilenDriveClient.File, String?>> { it.first.uploadedAt() }
+                        .thenBy { it.first.name.lowercase() }
+                )
             if (files.isEmpty()) error("No tracks found in ${musicPath()} (uuid: $root)")
 
             val sem = Semaphore(6)
@@ -173,7 +180,9 @@ class FilenExtension : ExtensionClient, LoginClient.CustomInput, HomeFeedClient,
         artists = meta?.artist?.let { listOf(Artist(id = it, name = it)) } ?: emptyList(),
         cover = meta?.coverPath?.let { ImageHolder.ResourceUriImageHolder("file://$it", false) },
         album = meta?.album?.let { Album(id = it, title = it) },
+        duration = meta?.durationMs,
         streamables = listOf(Streamable.server(uuid, 0, name, extras())),
+        releaseDate = uploadedAt().takeIf { it > 0 }?.let { Date(epochTimeMs = it) },
         extras = extras()
     )
 

@@ -12,7 +12,8 @@ import java.io.ByteArrayOutputStream
 
 class FilenTagService(private val http: OkHttpClient, private val apiKey: String) {
 
-    data class Meta(val title: String?, val artist: String?, val album: String?, val coverPath: String?)
+    data class Meta(val title: String?, val artist: String?, val album: String?, val coverPath: String?, val durationMs: Long?) {
+    }
 
     private val dir = java.io.File(System.getProperty("java.io.tmpdir") ?: ".", "filen_ext").also { it.mkdirs() }
     private val maxBytes = 4 * 1024 * 1024
@@ -68,7 +69,7 @@ class FilenTagService(private val http: OkHttpClient, private val apiKey: String
                 if (title == null) title = base.substringAfter(" - ").trim().ifEmpty { null }
             }
         }
-        return Meta(title, artist, tags.album, coverPath)
+        return Meta(title, artist, tags.album, coverPath, null)
     }
 
     private fun encode(m: Meta) = buildJsonObject {
@@ -78,6 +79,6 @@ class FilenTagService(private val http: OkHttpClient, private val apiKey: String
     private fun decode(s: String): Meta {
         val o = Json.parseToJsonElement(s).jsonObject
         fun str(k: String) = (o[k] as? JsonPrimitive)?.contentOrNull
-        return Meta(str("title"), str("artist"), str("album"), str("cover"))
+        return Meta(str("title"), str("artist"), str("album"), str("cover"), null)
     }
 }

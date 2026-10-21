@@ -7,6 +7,7 @@ import dev.brahmkshatriya.echo.common.settings.Settings
 import okhttp3.OkHttpClient
 import okhttp3.Request
 
+//TODO DELETE
 // For more information on which clients to use
 // visit https://brahmkshatriya.github.io/echo/common/dev.brahmkshatriya.echo.common/
 class TestExtension : ExtensionClient {

@@ -14,7 +14,6 @@ object AudioTagParser {
     private fun isId3(d: ByteArray) = d.size >= 10 && String(d, 0, 3, Charsets.ISO_8859_1) == "ID3"
     private fun isFlac(d: ByteArray) = d.size >= 4 && String(d, 0, 4, Charsets.ISO_8859_1) == "fLaC"
 
-    /** Byte necessari per avere tutti i metadati all'inizio del file (0 = formato non supportato). */
     fun requiredBytes(d: ByteArray): Int = when {
         isId3(d) -> 10 + synchsafe(d, 6)
         isFlac(d) -> flacMetadataEnd(d)
@@ -24,7 +23,7 @@ object AudioTagParser {
     private fun flacMetadataEnd(d: ByteArray): Int {
         var pos = 4
         while (true) {
-            if (pos + 4 > d.size) return d.size + 1 // header oltre i dati scaricati: ne servono altri
+            if (pos + 4 > d.size) return d.size + 1 // header
             val last = (u8(d, pos) and 0x80) != 0
             pos += 4 + ((u8(d, pos + 1) shl 16) or (u8(d, pos + 2) shl 8) or u8(d, pos + 3))
             if (last) return pos
@@ -62,7 +61,7 @@ object AudioTagParser {
             while (e < b.size && b[e].toInt() != 0) e++
             e + 1
         }
-        p += 1 // tipo immagine
+        p += 1
         val wide = enc == 1 || enc == 2
         while (p < b.size) {
             if (!wide && b[p].toInt() == 0) { p += 1; break }
@@ -148,8 +147,8 @@ object AudioTagParser {
                 6 -> { // PICTURE (big endian)
                     var p = start + 4
                     p += 4 + be32(d, p) // mime
-                    p += 4 + be32(d, p) // descrizione
-                    p += 16 // larghezza, altezza, profondità, colori
+                    p += 4 + be32(d, p) // desc
+                    p += 16
                     val dataLen = be32(d, p); p += 4
                     if (cover == null && dataLen > 0 && p + dataLen <= start + len) {
                         cover = d.copyOfRange(p, p + dataLen)
