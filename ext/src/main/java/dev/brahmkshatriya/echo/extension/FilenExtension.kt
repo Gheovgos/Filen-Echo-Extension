@@ -6,8 +6,11 @@ import dev.brahmkshatriya.echo.common.clients.LibraryFeedClient
 import dev.brahmkshatriya.echo.common.clients.LoginClient
 import dev.brahmkshatriya.echo.common.clients.TrackClient
 import dev.brahmkshatriya.echo.common.helpers.PagedData
+import dev.brahmkshatriya.echo.common.models.Album
+import dev.brahmkshatriya.echo.common.models.Artist
 import dev.brahmkshatriya.echo.common.models.Feed
 import dev.brahmkshatriya.echo.common.models.Feed.Companion.toFeed
+import dev.brahmkshatriya.echo.common.models.ImageHolder
 import dev.brahmkshatriya.echo.common.models.Shelf
 import dev.brahmkshatriya.echo.common.models.Streamable
 import dev.brahmkshatriya.echo.common.models.Track
@@ -20,7 +23,13 @@ import dev.brahmkshatriya.echo.extension.auth.FilenAuthManager
 import dev.brahmkshatriya.echo.extension.auth.FilenChunkInputStream
 import dev.brahmkshatriya.echo.extension.auth.FilenDriveClient
 import dev.brahmkshatriya.echo.extension.auth.FilenSession
+import dev.brahmkshatriya.echo.extension.auth.FilenTagService
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 
 class FilenExtension : ExtensionClient, LoginClient.CustomInput, HomeFeedClient, LibraryFeedClient,
@@ -33,6 +42,8 @@ class FilenExtension : ExtensionClient, LoginClient.CustomInput, HomeFeedClient,
     private val authManager = FilenAuthManager(apiClient)
 
     private var drive: FilenDriveClient? = null
+
+    private var tagService: FilenTagService? = null
 
     companion object {
         const val KEY_MUSIC_PATH = "music_path"
@@ -115,6 +126,7 @@ class FilenExtension : ExtensionClient, LoginClient.CustomInput, HomeFeedClient,
         }
         flog("setLoginUser: user=${user != null}, session=${session != null}")
         drive = session?.let { FilenDriveClient(apiClient, it) }
+        tagService = session?.let { FilenTagService(apiClient.client, it.apiKey) }
     }
 
     override suspend fun getCurrentUser(): User? {
@@ -128,32 +140,46 @@ class FilenExtension : ExtensionClient, LoginClient.CustomInput, HomeFeedClient,
     }
 
     override suspend fun loadHomeFeed(): Feed<Shelf> {
-        flog("Load home feed")
+        flog("Home Feed")
         val drive = drive ?: error("Do Login first")
+        val tags = tagService ?: error("Do Login first")
         return PagedData.Single<Shelf> {
             val root = drive.resolvePath(musicPath())
-            val tracks = flatten(drive.scan(root))
-            if (tracks.isEmpty()) error("No tracks found ${musicPath()} (uuid: $root)")
-            tracks.map { Shelf.Item(it) }
+            val files = collect(drive.scan(root))
+            if (files.isEmpty()) error("No tracks found in ${musicPath()} (uuid: $root)")
+
+            val sem = Semaphore(6)
+            val metas = coroutineScope {
+                files.map { (f, _) ->
+                    async(Dispatchers.IO) {
+                        sem.withPermit {
+                            f.uuid to try { tags.meta(f) } catch (e: Exception) { flog("tag ${f.name}", e); null }
+                        }
+                    }
+                }.awaitAll().toMap()
+            }
+            files.map { (f, label) -> Shelf.Item(f.toTrack(label, metas[f.uuid])) }
         }.toFeed(Feed.Buttons(showPlayAndShuffle = true))
     }
 
-    private fun flatten(node: FilenDriveClient.Node, parent: String? = null): List<Track> {
+    private fun collect(node: FilenDriveClient.Node, parent: String? = null): List<Pair<FilenDriveClient.File, String?>> {
         val label = listOfNotNull(parent, node.folder?.name).joinToString(" / ").ifEmpty { null }
-        return node.tracks.map { it.toTrack(label) } + node.children.flatMap { flatten(it, label) }
+        return node.tracks.map { it to label } + node.children.flatMap { collect(it, label) }
     }
+
+    private fun FilenDriveClient.File.toTrack(folder: String?, meta: FilenTagService.Meta?) = Track(
+        id = uuid,
+        title = meta?.title ?: name.substringBeforeLast('.'),
+        artists = meta?.artist?.let { listOf(Artist(id = it, name = it)) } ?: emptyList(),
+        cover = meta?.coverPath?.let { ImageHolder.ResourceUriImageHolder("file://$it", false) },
+        album = meta?.album?.let { Album(id = it, title = it) },
+        streamables = listOf(Streamable.server(uuid, 0, name, extras())),
+        extras = extras()
+    )
 
     private fun FilenDriveClient.File.extras() = mapOf(
         "uuid" to uuid, "name" to name, "region" to region, "bucket" to bucket,
         "key" to key, "chunks" to chunks.toString(), "size" to size.toString()
-    )
-
-    private fun FilenDriveClient.File.toTrack(folder: String?) = Track(
-        id = uuid,
-        title = name.substringBeforeLast('.'),
-        subtitle = folder,
-        streamables = listOf(Streamable.server(uuid, 0, name, extras())),
-        extras = extras()
     )
 
     // --- TrackClient ---
