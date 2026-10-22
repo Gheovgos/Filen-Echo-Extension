@@ -1,5 +1,7 @@
 package dev.brahmkshatriya.echo.extension
 
+import dev.brahmkshatriya.echo.common.clients.AlbumClient
+import dev.brahmkshatriya.echo.common.clients.ArtistClient
 import dev.brahmkshatriya.echo.common.clients.ExtensionClient
 import dev.brahmkshatriya.echo.common.clients.HomeFeedClient
 import dev.brahmkshatriya.echo.common.clients.LibraryFeedClient
@@ -37,7 +39,7 @@ import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 
 class FilenExtension : ExtensionClient, LoginClient.CustomInput, HomeFeedClient, LibraryFeedClient,
-    TrackClient, SearchFeedClient {
+    TrackClient, SearchFeedClient, ArtistClient, AlbumClient {
 
     private lateinit var settings: Settings
 
@@ -195,17 +197,23 @@ class FilenExtension : ExtensionClient, LoginClient.CustomInput, HomeFeedClient,
         }.toFeed(Feed.Buttons(showPlayAndShuffle = true))
     }
 
-    private fun FilenDriveClient.File.toTrack(folder: String?, meta: FilenTagService.Meta?) = Track(
-        id = uuid,
-        title = meta?.title ?: name.substringBeforeLast('.'),
-        artists = meta?.artist?.let { listOf(Artist(id = it, name = it)) } ?: emptyList(),
-        cover = meta?.coverPath?.let { ImageHolder.ResourceUriImageHolder("file://$it", false) },
-        album = meta?.album?.let { Album(id = it, title = it) },
-        duration = meta?.durationMs,
-        streamables = listOf(Streamable.server(uuid, 0, name, extras())),
-        releaseDate = uploadedAt().takeIf { it > 0 }?.let { Date(epochTimeMs = it) },
-        extras = extras()
-    )
+    private fun FilenDriveClient.File.toTrack(folder: String?, meta: FilenTagService.Meta?): Track {
+        val artistName = meta?.artist?.let(::firstArtist)
+        val artist = artistName?.let { Artist(id = artistKey(it), name = it) }
+        return Track(
+            id = uuid,
+            title = meta?.title ?: name.substringBeforeLast('.'),
+            artists = listOfNotNull(artist),
+            cover = meta?.coverPath?.let { ImageHolder.ResourceUriImageHolder("file://$it", false) },
+            album = meta?.album?.takeIf { it.isNotBlank() }?.let {
+                Album(id = albumKey(artistName, it), title = it, artists = listOfNotNull(artist))
+            },
+            duration = meta?.durationMs,
+            streamables = listOf(Streamable.server(uuid, 0, name, extras())),
+            releaseDate = uploadedAt().takeIf { it > 0 }?.let { Date(epochTimeMs = it) },
+            extras = extras()
+        )
+    }
 
     private fun FilenDriveClient.File.extras() = mapOf(
         "uuid" to uuid, "name" to name, "region" to region, "bucket" to bucket,
@@ -273,5 +281,62 @@ class FilenExtension : ExtensionClient, LoginClient.CustomInput, HomeFeedClient,
         tracksCache = Triple(path, System.currentTimeMillis(), list)
         list
     }
+
+    /* ---------- ARTIST & ALBUM CLIENTS ----------*/
+
+    private val multiArtistRegex = Regex("""\s*;\s*|\s+\(?(?:feat|ft|featuring)\.?\s+""", RegexOption.IGNORE_CASE)
+
+    private fun firstArtist(raw: String): String? =
+        raw.split(multiArtistRegex).firstOrNull()?.trim()?.ifEmpty { null }
+
+    private fun artistKey(name: String) = normalize(name)
+
+    private fun albumKey(artist: String?, album: String) =
+        "${artist?.let(::normalize).orEmpty()}||${normalize(album)}"
+
+    private suspend fun tracksOfArtist(artistId: String): List<Track> =
+        allTracks().filter { it.artists.firstOrNull()?.id == artistId }
+
+    private suspend fun tracksOfAlbum(albumId: String): List<Track> =
+        allTracks().filter { it.album?.id == albumId }
+
+    private fun firstCover(tracks: List<Track>): ImageHolder? =
+        tracks.firstNotNullOfOrNull { it.cover }
+
+    // --- ArtistClient ---
+
+    override suspend fun loadArtist(artist: Artist): Artist {
+        val cover = firstCover(tracksOfArtist(artist.id))
+        return artist.copy(cover = cover, background = cover)
+    }
+
+    override suspend fun loadFeed(artist: Artist): Feed<Shelf> =
+        PagedData.Single<Shelf> {
+            tracksOfArtist(artist.id).map { Shelf.Item(it) }
+        }.toFeed(Feed.Buttons(showPlayAndShuffle = true))
+
+    // --- AlbumClient ---
+
+    private suspend fun albumTracks(albumId: String): List<Track> =
+        tracksOfAlbum(albumId).sortedBy { it.extras["name"]?.lowercase().orEmpty() }
+
+    override suspend fun loadAlbum(album: Album): Album {
+        val tracks = albumTracks(album.id)
+        if (tracks.isEmpty()) return album
+        val cover = firstCover(tracks)
+        return album.copy(
+            cover = cover,
+            background = cover,
+            trackCount = tracks.size.toLong(),
+            duration = tracks.mapNotNull { it.duration }.takeIf { it.isNotEmpty() }?.sum(),
+            artists = album.artists.ifEmpty { tracks.first().artists }
+        )
+    }
+
+    override suspend fun loadFeed(album: Album): Feed<Shelf>? = null
+
+    override suspend fun loadTracks(album: Album): Feed<Track> =
+        PagedData.Single { albumTracks(album.id) }
+            .toFeed(Feed.Buttons(showPlayAndShuffle = true))
 
 }

@@ -14,9 +14,6 @@ Once you've logged in, enter the full path to the directory. By default, it poin
 If everything is configured correctly, you should see all the audio files on the Home screen. There are still quite a few features to be implemented; I'll create a separate section for future updates.
 ### 4. TODO for future
 All features/classes to be implemented:
-- SearchFeedClient
 - Library/Playlists
-- ArtistClient
-- AlbumClient
 
 IDK other features, but I'm open to suggestion
