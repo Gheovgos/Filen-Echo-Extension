@@ -4,6 +4,7 @@ import dev.brahmkshatriya.echo.common.clients.ExtensionClient
 import dev.brahmkshatriya.echo.common.clients.HomeFeedClient
 import dev.brahmkshatriya.echo.common.clients.LibraryFeedClient
 import dev.brahmkshatriya.echo.common.clients.LoginClient
+import dev.brahmkshatriya.echo.common.clients.SearchFeedClient
 import dev.brahmkshatriya.echo.common.clients.TrackClient
 import dev.brahmkshatriya.echo.common.helpers.PagedData
 import dev.brahmkshatriya.echo.common.models.Album
@@ -29,12 +30,14 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 
 class FilenExtension : ExtensionClient, LoginClient.CustomInput, HomeFeedClient, LibraryFeedClient,
-    TrackClient {
+    TrackClient, SearchFeedClient {
 
     private lateinit var settings: Settings
 
@@ -128,6 +131,7 @@ class FilenExtension : ExtensionClient, LoginClient.CustomInput, HomeFeedClient,
         flog("setLoginUser: user=${user != null}, session=${session != null}")
         drive = session?.let { FilenDriveClient(apiClient, it) }
         tagService = session?.let { FilenTagService(apiClient.client, it.apiKey) }
+        tracksCache = null
     }
 
     override suspend fun getCurrentUser(): User? {
@@ -144,34 +148,51 @@ class FilenExtension : ExtensionClient, LoginClient.CustomInput, HomeFeedClient,
 
     override suspend fun loadHomeFeed(): Feed<Shelf> {
         flog("Home Feed")
-        val drive = drive ?: error("Do Login first")
-        val tags = tagService ?: error("Do Login first")
         return PagedData.Single<Shelf> {
-            val root = drive.resolvePath(musicPath())
-            val files = collect(drive.scan(root))
-                .sortedWith(
-                    compareByDescending<Pair<FilenDriveClient.File, String?>> { it.first.uploadedAt() }
-                        .thenBy { it.first.name.lowercase() }
-                )
-            if (files.isEmpty()) error("No tracks found in ${musicPath()} (uuid: $root)")
-
-            val sem = Semaphore(6)
-            val metas = coroutineScope {
-                files.map { (f, _) ->
-                    async(Dispatchers.IO) {
-                        sem.withPermit {
-                            f.uuid to try { tags.meta(f) } catch (e: Exception) { flog("tag ${f.name}", e); null }
-                        }
-                    }
-                }.awaitAll().toMap()
-            }
-            files.map { (f, label) -> Shelf.Item(f.toTrack(label, metas[f.uuid])) }
+            allTracks(force = true).map { Shelf.Item(it) }
         }.toFeed(Feed.Buttons(showPlayAndShuffle = true))
     }
 
     private fun collect(node: FilenDriveClient.Node, parent: String? = null): List<Pair<FilenDriveClient.File, String?>> {
         val label = listOfNotNull(parent, node.folder?.name).joinToString(" / ").ifEmpty { null }
         return node.tracks.map { it to label } + node.children.flatMap { collect(it, label) }
+    }
+
+    private fun normalize(s: String): String =
+        java.text.Normalizer.normalize(s.lowercase(), java.text.Normalizer.Form.NFD)
+            .replace(Regex("\\p{M}+"), "")
+
+    private fun score(t: Track, tokens: List<String>): Int? {
+        val title = normalize(t.title)
+        val artists = normalize(t.artists.joinToString(" ") { it.name })
+        val album = normalize(t.album?.title.orEmpty())
+        val file = normalize(t.extras["name"].orEmpty())
+        var total = 0
+        for (tok in tokens) {
+            total += when {
+                title.startsWith(tok) -> 5
+                title.contains(" $tok") -> 4
+                title.contains(tok) -> 3
+                artists.contains(tok) -> 2
+                album.contains(tok) || file.contains(tok) -> 1
+                else -> return null
+            }
+        }
+        return total
+    }
+
+    override suspend fun loadSearchFeed(query: String): Feed<Shelf> {
+        flog("Search: $query")
+        val tokens = normalize(query).split(' ').filter { it.isNotBlank() }
+        return PagedData.Single<Shelf> {
+            if (tokens.isEmpty()) {
+                emptyList()
+            } else {
+                allTracks().mapNotNull { t -> score(t, tokens)?.let { t to it } }
+                    .sortedByDescending { it.second }
+                    .map { Shelf.Item(it.first) }
+            }
+        }.toFeed(Feed.Buttons(showPlayAndShuffle = true))
     }
 
     private fun FilenDriveClient.File.toTrack(folder: String?, meta: FilenTagService.Meta?) = Track(
@@ -214,6 +235,43 @@ class FilenExtension : ExtensionClient, LoginClient.CustomInput, HomeFeedClient,
             listOf(Streamable.Source.Raw(streamProvider = provider, id = file.uuid)),
             merged = false
         )
+    }
+
+    /* ---------- SEARCH FIND CLIENT ----------*/
+
+    private var tracksCache: Triple<String, Long, List<Track>>? = null
+    private val tracksMutex = Mutex()
+    private val cacheTtlMs = 5 * 60 * 1000L
+
+    private suspend fun allTracks(force: Boolean = false): List<Track> = tracksMutex.withLock {
+        val path = musicPath()
+        tracksCache?.let { (p, t, list) ->
+            if (!force && p == path && System.currentTimeMillis() - t < cacheTtlMs) return list
+        }
+        val drive = drive ?: error("Do Login first")
+        val tags = tagService ?: error("Do Login first")
+
+        val root = drive.resolvePath(path)
+        val files = collect(drive.scan(root))
+            .sortedWith(
+                compareByDescending<Pair<FilenDriveClient.File, String?>> { it.first.uploadedAt() }
+                    .thenBy { it.first.name.lowercase() }
+            )
+        if (files.isEmpty()) error("No tracks found in $path (uuid: $root)")
+
+        val sem = Semaphore(6)
+        val metas = coroutineScope {
+            files.map { (f, _) ->
+                async(Dispatchers.IO) {
+                    sem.withPermit {
+                        f.uuid to try { tags.meta(f) } catch (e: Exception) { flog("tag ${f.name}", e); null }
+                    }
+                }
+            }.awaitAll().toMap()
+        }
+        val list = files.map { (f, label) -> f.toTrack(label, metas[f.uuid]) }
+        tracksCache = Triple(path, System.currentTimeMillis(), list)
+        list
     }
 
 }
