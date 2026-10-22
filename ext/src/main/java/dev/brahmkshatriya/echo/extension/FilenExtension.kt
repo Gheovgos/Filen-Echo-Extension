@@ -6,6 +6,7 @@ import dev.brahmkshatriya.echo.common.clients.ExtensionClient
 import dev.brahmkshatriya.echo.common.clients.HomeFeedClient
 import dev.brahmkshatriya.echo.common.clients.LibraryFeedClient
 import dev.brahmkshatriya.echo.common.clients.LoginClient
+import dev.brahmkshatriya.echo.common.clients.PlaylistClient
 import dev.brahmkshatriya.echo.common.clients.SearchFeedClient
 import dev.brahmkshatriya.echo.common.clients.TrackClient
 import dev.brahmkshatriya.echo.common.helpers.PagedData
@@ -15,11 +16,13 @@ import dev.brahmkshatriya.echo.common.models.Date
 import dev.brahmkshatriya.echo.common.models.Feed
 import dev.brahmkshatriya.echo.common.models.Feed.Companion.toFeed
 import dev.brahmkshatriya.echo.common.models.ImageHolder
+import dev.brahmkshatriya.echo.common.models.Playlist
 import dev.brahmkshatriya.echo.common.models.Shelf
 import dev.brahmkshatriya.echo.common.models.Streamable
 import dev.brahmkshatriya.echo.common.models.Track
 import dev.brahmkshatriya.echo.common.models.User
 import dev.brahmkshatriya.echo.common.settings.Setting
+import dev.brahmkshatriya.echo.common.settings.SettingSwitch
 import dev.brahmkshatriya.echo.common.settings.SettingTextInput
 import dev.brahmkshatriya.echo.common.settings.Settings
 import dev.brahmkshatriya.echo.extension.auth.FilenApiClient
@@ -39,7 +42,7 @@ import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 
 class FilenExtension : ExtensionClient, LoginClient.CustomInput, HomeFeedClient, LibraryFeedClient,
-    TrackClient, SearchFeedClient, ArtistClient, AlbumClient {
+    TrackClient, SearchFeedClient, ArtistClient, AlbumClient, PlaylistClient {
 
     private lateinit var settings: Settings
 
@@ -53,7 +56,10 @@ class FilenExtension : ExtensionClient, LoginClient.CustomInput, HomeFeedClient,
 
     companion object {
         const val KEY_MUSIC_PATH = "music_path"
-        const val DEFAULT_MUSIC_PATH = "/echomusic"     // DEFAULT PATH
+        const val KEY_RECURSIVE = "recursive"
+        const val KEY_PLAYLIST_FILES = "playlist_files"
+        const val KEY_PLAYLIST_FOLDERS = "playlist_folders"
+        const val DEFAULT_MUSIC_PATH = "/echomusic"     // DEFAULT
     }
 
     private var currentUser: User? = null
@@ -61,16 +67,26 @@ class FilenExtension : ExtensionClient, LoginClient.CustomInput, HomeFeedClient,
 
     // --- ExtensionClient / SettingsProvider ---
 
-    override suspend fun getSettingItems(): List<Setting> {
-        flog("getSettingItems")
-        return listOf(SettingTextInput(
-                "Music Path",
-                KEY_MUSIC_PATH,
-                "Path of folder to use, ex. /Music/Echo",
-                DEFAULT_MUSIC_PATH
-            )
+    override suspend fun getSettingItems(): List<Setting> = listOf(
+        SettingTextInput(
+            "Music folders", KEY_MUSIC_PATH,
+            "Folders to scan, separated by ; (e.g. /Music;/Downloads/Songs)", DEFAULT_MUSIC_PATH
+        ),
+        SettingSwitch("Include subfolders", KEY_RECURSIVE, "Search music in subfolders too", true),
+        SettingTextInput(
+            "Playlist files", KEY_PLAYLIST_FILES,
+            "Full paths of .m3u/.m3u8 files, separated by ;", null
+        ),
+        SettingTextInput(
+            "Playlist folders", KEY_PLAYLIST_FOLDERS,
+            "Folders whose .m3u/.m3u8 files are all imported, separated by ;", null
         )
-    }
+    )
+
+    private fun pathList(raw: String?): List<String> =
+        raw.orEmpty().split(';', '\n').map { it.trim() }.filter { it.isNotEmpty() }
+            .map { "/" + it.replace('\\', '/').split('/').filter(String::isNotBlank).joinToString("/") }
+            .distinct()
 
     override suspend fun onInitialize() { flog("onInitialize") }
 
@@ -81,10 +97,10 @@ class FilenExtension : ExtensionClient, LoginClient.CustomInput, HomeFeedClient,
         flog("setSettings, settings: $settings")
     }
 
-    private fun musicPath(): String {
-        val raw = settings.getString(KEY_MUSIC_PATH)?.ifBlank { null } ?: DEFAULT_MUSIC_PATH
-        return "/" + raw.trim().split('/').filter { it.isNotBlank() }.joinToString("/")
-    }
+    private fun musicPaths(): List<String> =
+        pathList(settings.getString(KEY_MUSIC_PATH)).ifEmpty { listOf(DEFAULT_MUSIC_PATH) }
+
+    private fun recursiveEnabled(): Boolean = settings.getBoolean(KEY_RECURSIVE) ?: true
 
     // --- LoginClient.CustomInput ---
 
@@ -141,10 +157,8 @@ class FilenExtension : ExtensionClient, LoginClient.CustomInput, HomeFeedClient,
         return currentUser?.copy(extras = emptyMap())
     }
 
-    override suspend fun loadLibraryFeed(): Feed<Shelf> {
-        flog("loadLibraryFeed: ENTRATA")
-        return emptyList<Shelf>().toFeed()
-    }
+    override suspend fun loadLibraryFeed(): Feed<Shelf> =
+        PagedData.Single<Shelf> { playlistFiles().map { Shelf.Item(it.toPlaylist()) } }.toFeed()
 
     private fun FilenDriveClient.File.uploadedAt() = if (creation > 0) creation else lastModified
 
@@ -211,7 +225,7 @@ class FilenExtension : ExtensionClient, LoginClient.CustomInput, HomeFeedClient,
             duration = meta?.durationMs,
             streamables = listOf(Streamable.server(uuid, 0, name, extras())),
             releaseDate = uploadedAt().takeIf { it > 0 }?.let { Date(epochTimeMs = it) },
-            extras = extras()
+            extras = extras() + ("folder" to (folder ?: ""))
         )
     }
 
@@ -252,23 +266,37 @@ class FilenExtension : ExtensionClient, LoginClient.CustomInput, HomeFeedClient,
     private val cacheTtlMs = 5 * 60 * 1000L
 
     private suspend fun allTracks(force: Boolean = false): List<Track> = tracksMutex.withLock {
-        val path = musicPath()
-        tracksCache?.let { (p, t, list) ->
-            if (!force && p == path && System.currentTimeMillis() - t < cacheTtlMs) return list
+        val roots = musicPaths()
+        val recursive = recursiveEnabled()
+        val key = roots.joinToString(";") + "|" + recursive
+        tracksCache?.let { (k, t, list) ->
+            if (!force && k == key && System.currentTimeMillis() - t < cacheTtlMs) return list
         }
         val drive = drive ?: error("Do Login first")
         val tags = tagService ?: error("Do Login first")
 
-        val root = drive.resolvePath(path)
-        val files = collect(drive.scan(root))
+        val errors = mutableListOf<String>()
+        val found = mutableListOf<Pair<FilenDriveClient.File, String?>>()
+        for (path in roots) {
+            try {
+                val root = drive.resolvePath(path)
+                found += collect(drive.scan(root, maxDepth = if (recursive) 8 else 0))
+            } catch (e: Exception) {
+                flog("folder $path", e)
+                errors += "$path: ${e.message}"
+            }
+        }
+        val files = found.distinctBy { it.first.uuid }
             .sortedWith(
                 compareByDescending<Pair<FilenDriveClient.File, String?>> { it.first.uploadedAt() }
                     .thenBy { it.first.name.lowercase() }
             )
-        if (files.isEmpty()) error("No tracks found in $path (uuid: $root)")
+        if (files.isEmpty()) {
+            error("No tracks found in ${roots.joinToString()}" + if (errors.isEmpty()) "" else " (${errors.joinToString("; ")})")
+        }
 
         val sem = Semaphore(6)
-        val metas = coroutineScope {
+        val metas: Map<String, FilenTagService.Meta?> = coroutineScope {
             files.map { (f, _) ->
                 async(Dispatchers.IO) {
                     sem.withPermit {
@@ -278,7 +306,7 @@ class FilenExtension : ExtensionClient, LoginClient.CustomInput, HomeFeedClient,
             }.awaitAll().toMap()
         }
         val list = files.map { (f, label) -> f.toTrack(label, metas[f.uuid]) }
-        tracksCache = Triple(path, System.currentTimeMillis(), list)
+        tracksCache = Triple(key, System.currentTimeMillis(), list)
         list
     }
 
@@ -338,5 +366,96 @@ class FilenExtension : ExtensionClient, LoginClient.CustomInput, HomeFeedClient,
     override suspend fun loadTracks(album: Album): Feed<Track> =
         PagedData.Single { albumTracks(album.id) }
             .toFeed(Feed.Buttons(showPlayAndShuffle = true))
+
+    /* ---------- ARTIST & ALBUM CLIENTS ----------*/
+
+    private val playlistExt = setOf("m3u", "m3u8")
+
+    private fun FilenDriveClient.File.toPlaylist() = Playlist(
+        id = uuid, title = name.substringBeforeLast('.'), isEditable = false, extras = extras()
+    )
+
+    private fun fileFromExtras(e: Map<String, String>) = FilenDriveClient.File(
+        uuid = e.getValue("uuid"), name = e.getValue("name"), mime = "",
+        size = e.getValue("size").toLong(), key = e.getValue("key"),
+        region = e.getValue("region"), bucket = e.getValue("bucket"),
+        chunks = e.getValue("chunks").toInt()
+    )
+
+    private suspend fun playlistFiles(): List<FilenDriveClient.File> {
+        val drive = drive ?: error("Do Login first")
+        val result = LinkedHashMap<String, FilenDriveClient.File>()
+
+        for (path in pathList(settings.getString(KEY_PLAYLIST_FILES))) {
+            try {
+                val parent = path.substringBeforeLast('/', "").ifEmpty { "/" }
+                val fileName = path.substringAfterLast('/')
+                val f = drive.list(drive.resolvePath(parent)).files.firstOrNull { it.name.equals(fileName, true) }
+                if (f != null) result[f.uuid] = f else flog("playlist not found: $path")
+            } catch (e: Exception) { flog("playlist $path", e) }
+        }
+        for (path in pathList(settings.getString(KEY_PLAYLIST_FOLDERS))) {
+            try {
+                drive.list(drive.resolvePath(path)).files
+                    .filter { it.name.substringAfterLast('.', "").lowercase() in playlistExt }
+                    .forEach { result[it.uuid] = it }
+            } catch (e: Exception) { flog("playlist $path", e) }
+        }
+        return result.values.sortedBy { it.name.lowercase() }
+    }
+
+    private fun stem(name: String) = normalize(name.substringBeforeLast('.'))
+
+    private fun trackSegments(t: Track): List<String> =
+        t.extras["folder"].orEmpty().split(" / ").filter { it.isNotBlank() }.map(::normalize) +
+                stem(t.extras["name"].orEmpty())
+
+    private fun resolveEntry(entry: String, index: Map<String, List<Track>>): Track? {
+        val parts = entry.replace('\\', '/').split('/')
+            .filter { it.isNotBlank() && it != "." && it != ".." && !Regex("[A-Za-z]:").matches(it) }
+        if (parts.isEmpty()) return null
+        val segs = parts.dropLast(1).map(::normalize) + stem(parts.last())
+        val candidates = index[stem(parts.last())] ?: return null
+        return candidates.maxByOrNull { t ->
+            val ts = trackSegments(t)
+            var n = 0
+            while (n < minOf(segs.size, ts.size) && segs[segs.size - 1 - n] == ts[ts.size - 1 - n]) n++
+            n
+        }
+    }
+
+    private suspend fun playlistTracks(playlist: Playlist): List<Track> {
+        val s = session ?: error("Do Login first")
+        val file = fileFromExtras(playlist.extras)
+        val bytes = withContext(Dispatchers.IO) {
+            FilenChunkInputStream(apiClient.client, s.apiKey, file, 0).use { it.readBytes() }
+        }
+        var text = bytes.toString(Charsets.UTF_8).removePrefix("\uFEFF")
+        if ('\uFFFD' in text) text = bytes.toString(Charsets.ISO_8859_1) // .m3u
+
+        val entries = text.lineSequence().map { it.trim() }
+            .filter { it.isNotEmpty() && !it.startsWith("#") && !it.startsWith("http", ignoreCase = true) }
+            .toList()
+        val index = allTracks().groupBy { stem(it.extras["name"].orEmpty()) }
+        return entries.mapNotNull { resolveEntry(it, index) }
+    }
+
+// --- Library: le playlist ---
+
+
+
+// --- PlaylistClient ---
+
+    override suspend fun loadPlaylist(playlist: Playlist): Playlist {
+        val tracks = playlistTracks(playlist)
+        val cover = firstCover(tracks)
+        return playlist.copy(trackCount = tracks.size.toLong(), cover = cover, background = cover)
+    }
+
+    override suspend fun loadTracks(playlist: Playlist): Feed<Track> =
+        PagedData.Single<Track> { playlistTracks(playlist) }
+            .toFeed(Feed.Buttons(showPlayAndShuffle = true))
+
+    override suspend fun loadFeed(playlist: Playlist): Feed<Shelf>? = null
 
 }
